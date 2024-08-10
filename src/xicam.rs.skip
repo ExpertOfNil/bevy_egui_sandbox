@@ -1,0 +1,151 @@
+pub struct BufferedCamera {
+    id: u32,
+    rt_handle: tokio::runtime::Handle,
+    buffer: Arc<Mutex<RingBuffer>>,
+    image_size: ImageSize,
+    shutdown: Arc<Mutex<bool>>,
+}
+
+impl BufferedCamera {
+    pub const SMOOTH_WINDOW: usize = 100;
+
+    pub fn new(
+        id: u32,
+        rt_handle: tokio::runtime::Handle,
+        buf_size: usize,
+        image_size: ImageSize,
+    ) -> Self {
+        Self {
+            id,
+            rt_handle,
+            image_size,
+            buffer: Arc::new(Mutex::new(RingBuffer::new(buf_size, image_size))),
+            shutdown: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    pub fn get_data(&self) -> Data {
+        let guard = self.buffer.lock().unwrap();
+        (*guard).pop()
+    }
+
+    pub fn make_images(&self) -> tokio::task::JoinHandle<()> {
+        log::warn!("Camera {} making images", self.id);
+        let mut cam = xiapi::open_device(Some(self.id)).expect("Failed to open device");
+        self.setup_camera(&mut cam).expect("Failed to setup camera");
+        let buffer = cam
+            .start_acquisition()
+            .expect("Failed to start acquisition");
+
+        let buffer_ptr = self.buffer.clone();
+        let shutdown_ptr = self.shutdown.clone();
+        self.rt_handle.spawn(async move {
+            let mut i = 0;
+            let mut times = [0_u128; Self::SMOOTH_WINDOW];
+            loop {
+                {
+                    let sd_guard = shutdown_ptr.lock().unwrap();
+                    if *sd_guard {
+                        break;
+                    }
+                }
+                //Start
+                let start = std::time::Instant::now();
+                let xi_img: xiapi::Image<'_, u8> = buffer
+                    .next_image::<u8>(None)
+                    .expect("Failed to get raw image");
+                {
+                    let mut guard = buffer_ptr.lock().unwrap();
+                    let img_buffer = ColorImage::from_rgba_unmultiplied(
+                        [xi_img.width() as usize, xi_img.height() as usize],
+                        xi_img.data(),
+                    );
+                    //Stop
+                    let end = std::time::Instant::now();
+                    let delta = end.duration_since(start).as_millis();
+                    times[i] = delta;
+                    let avg_fps =
+                        1_000.0 / (times.iter().sum::<u128>() as f32 / Self::SMOOTH_WINDOW as f32);
+                    (*guard).push((img_buffer, avg_fps));
+                    i = (i + 1) % Self::SMOOTH_WINDOW;
+                }
+            }
+        })
+    }
+    pub fn shutdown(&mut self) {
+        *self.shutdown.lock().unwrap() = true;
+    }
+
+    fn setup_camera(&self, cam: &mut xiapi::Camera) -> anyhow::Result<()> {
+        cam.set_exposure(20_000.0)
+            .map_err(|_| anyhow!("Failed to set exposure"))?;
+        cam.set_image_data_format(xiapi::XI_IMG_FORMAT::XI_RGB32)
+            .map_err(|_| anyhow!("Failed to set format to XI_RGB32"))?;
+        cam.set_output_data_bit_depth(xiapi::XI_BIT_DEPTH::XI_BPP_8)
+            .map_err(|_| anyhow!("Failed to set device bit depth"))?;
+        let w_inc = cam
+            .width_increment()
+            .map_err(|_| anyhow!("Failed to get width increment"))?;
+        let width = (self.image_size.width() / w_inc) * w_inc;
+        cam.set_width(width)
+            .map_err(|_| anyhow!("Failed to set width"))?;
+        let h_inc = cam
+            .width_increment()
+            .map_err(|_| anyhow!("Failed to get width increment"))?;
+        let height = (self.image_size.height() / h_inc) * h_inc;
+        cam.set_height(height)
+            .map_err(|_| anyhow!("Failed to set height"))?;
+
+        cam.set_wb_kr(1.29)
+            .map_err(|_| anyhow!("Failed to set white balance red"))?;
+        cam.set_wb_kg(1.0)
+            .map_err(|_| anyhow!("Failed to set white balance blue"))?;
+        cam.set_wb_kb(3.04)
+            .map_err(|_| anyhow!("Failed to set white balance green"))?;
+
+        Self::set_param_int(cam, xiapi::XI_PRM_IMAGE_DATA_FORMAT_RGB32_ALPHA, 255)
+            .map_err(|_| anyhow!("Failed to set alpha to 255"))?;
+
+        Self::set_param_int(
+            cam,
+            xiapi::XI_PRM_LIMIT_BANDWIDTH_MODE,
+            xiapi::XI_SWITCH::XI_ON as i32,
+        )
+        .map_err(|_| anyhow!("Failed to set bandwidth limit on"))?;
+        let lim_bw_mode = Self::get_param_int(cam, xiapi::XI_PRM_LIMIT_BANDWIDTH_MODE)
+            .map_err(|_| anyhow!("Failed to get bandwidth limit mode"))?;
+        assert_eq!(lim_bw_mode, xiapi::XI_SWITCH::XI_ON as i32);
+        let max_bandwidth = cam
+            .limit_bandwidth_maximum()
+            .map_err(|_| anyhow!("Failed to get bandwidth limit max"))?;
+        cam.set_limit_bandwidth(max_bandwidth)
+            .map_err(|_| anyhow!("Failed to set bandwidth limit"))?;
+        Ok(())
+    }
+
+    fn set_param_int(cam: &mut xiapi::Camera, param: &[u8], value: i32) -> anyhow::Result<()> {
+        let ok = xiapi::XI_RET::XI_OK as xiapi::XI_RETURN;
+        unsafe {
+            match xiapi::xiSetParamInt(**cam, param.as_ptr() as *const i8, value) {
+                ret if ret == ok => Ok(()),
+                e => Err(anyhow!(
+                    "Failed to set {:?}: Error {}",
+                    String::from_utf8(param.to_vec())?,
+                    e
+                )),
+            }
+        }
+    }
+
+    fn get_param_int(cam: &mut xiapi::Camera, param: &[u8]) -> anyhow::Result<i32> {
+        let ok = xiapi::XI_RET::XI_OK as xiapi::XI_RETURN;
+        unsafe {
+            let mut value = 0_i32;
+            match xiapi::xiGetParamInt(**cam, param.as_ptr() as *const i8, &mut value) {
+                ret if ret == ok => Ok(value),
+                e => Err(anyhow!("Failed to get value: Error {}", e)),
+            }
+        }
+    }
+}
+
